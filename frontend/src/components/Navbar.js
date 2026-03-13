@@ -76,9 +76,10 @@ export const Navbar = () => {
           <button
             onClick={() => setIsOpen(!isOpen)}
             data-testid="hamburger-menu-button"
-            className="md:hidden text-white p-2 relative z-50"
+            className="block md:hidden text-white p-2 relative z-[60] min-w-[44px] min-h-[44px] flex items-center justify-center"
+            aria-label="Toggle menu"
           >
-            {isOpen ? <X size={24} /> : <Menu size={24} />}
+            {isOpen ? <X size={28} /> : <Menu size={28} />}
           </button>
         </div>
       </div>
