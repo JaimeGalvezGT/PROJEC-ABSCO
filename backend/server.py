@@ -1,15 +1,16 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import asyncio
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional
 import uuid
 from datetime import datetime, timezone
-
+import resend
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -19,54 +20,98 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
+# Resend config
+resend.api_key = os.environ.get('RESEND_API_KEY', '')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'onboarding@resend.dev')
+
+# Create the main app
 app = FastAPI()
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+# Models
+class ContactForm(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    service_type: Optional[str] = None
+    message: str
 
-# Add your routes to the router instead of directly to app
+
+class ContactResponse(BaseModel):
+    id: str
+    status: str
+    message: str
+
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "ABSCO API Running"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.post("/contact", response_model=ContactResponse)
+async def submit_contact(form: ContactForm):
+    contact_id = str(uuid.uuid4())
 
-# Include the router in the main app
+    # Store in MongoDB
+    doc = {
+        "id": contact_id,
+        "name": form.name,
+        "email": form.email,
+        "phone": form.phone or "",
+        "service_type": form.service_type or "General",
+        "message": form.message,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.contacts.insert_one(doc)
+
+    # Send email via Resend
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #7c3aed;">New Contact from ABSCO Website</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr><td style="padding: 8px; font-weight: bold;">Name:</td><td style="padding: 8px;">{form.name}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Email:</td><td style="padding: 8px;">{form.email}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Phone:</td><td style="padding: 8px;">{form.phone or 'N/A'}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Service:</td><td style="padding: 8px;">{form.service_type or 'General'}</td></tr>
+        </table>
+        <div style="padding: 16px; background: #f3f4f6; border-radius: 8px; margin-top: 16px;">
+            <p style="font-weight: bold; margin: 0 0 8px;">Message:</p>
+            <p style="margin: 0;">{form.message}</p>
+        </div>
+    </div>
+    """
+
+    try:
+        params = {
+            "from": SENDER_EMAIL,
+            "to": ["abscocleaning@yahoo.com"],
+            "subject": f"ABSCO Website Contact - {form.name}",
+            "html": html_content
+        }
+        email_result = await asyncio.to_thread(resend.Emails.send, params)
+        logger.info(f"Email sent successfully: {email_result}")
+    except Exception as e:
+        logger.error(f"Failed to send email: {str(e)}")
+        # Still return success since we saved to DB
+
+    return ContactResponse(
+        id=contact_id,
+        status="success",
+        message="Thank you! We'll get back to you soon."
+    )
+
+
+# Include the router
 app.include_router(api_router)
 
 app.add_middleware(
@@ -77,12 +122,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
